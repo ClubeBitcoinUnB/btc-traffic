@@ -1,14 +1,18 @@
 use bitcoin::address::Address;
 use clap::Parser;
-use corepc_node as node;
+use corepc_node::{self as node};
 use node::{Conf, Node, P2P};
-use rand::prelude::*;
 use std::net::SocketAddrV4;
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+
+use crate::utils::mutated_block::MutatedBlockError;
+use crate::utils::wallet_funds::add_wallet_funds;
+
+mod utils;
 
 /// Simple regtest traffic generator for bitcoin test and development
 #[derive(Parser, Debug)]
@@ -85,7 +89,11 @@ impl DerefMut for Network {
 
 impl Network {
     fn new(cli: &Cli) -> Network {
-        let bitcoind_path = node::exe_path().expect("Can't find bitcoind executable");
+        let bitcoind_path = cli
+            .bitcoind_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| node::exe_path().expect("Can't find bitcoind executable"));
         let n = cli.nodes.get();
         let mut network = Vec::with_capacity(n as usize);
 
@@ -106,14 +114,27 @@ impl Network {
         Network(network)
     }
 
-    fn mine(self: &Self) {
+    fn mine(self: &Self, nblocks: Option<usize>) {
+        let nblocks = nblocks.unwrap_or(1);
         let size = self.len();
         let n = rand::random_range(0..size);
-        println!("Mining with node {}", n);
+        println!("Mining with node {}, {} blocks", n, nblocks);
 
         let addr = &self[n].mine_addr;
-        let block = self[n].node.client.generate_to_address(1, addr).unwrap();
+        let block = self[n]
+            .node
+            .client
+            .generate_to_address(nblocks, addr)
+            .unwrap();
         println!("{:?}", block);
+
+        // wait all nodes sync
+        while self.iter().any(|i| {
+            let height = i.node.client.get_block_count().unwrap().0;
+            height < self[n].node.client.get_block_count().unwrap().0
+        }) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -125,8 +146,35 @@ async fn main() {
     let network = Network::new(&cli);
     println!("{:?}", network);
 
+    // network maturity to make above coinbase transaction valid
+    // TODO: refactor it to make a global balance so we avoid this solution
+    network.mine(Some(105));
+
+    let peer = &network[0].node;
+    let wallet_funds = add_wallet_funds(&peer.client, None).await.unwrap();
+
+    let _ = MutatedBlockError::BadTxnMrklRoot
+        .print_mutated_block_raw_hash(&peer.client, &wallet_funds.address)
+        .await;
+
+    let _ = MutatedBlockError::BadTxnsDuplicate
+        .print_mutated_block_raw_hash(&peer.client, &wallet_funds.address)
+        .await;
+
+    let _ = MutatedBlockError::BadWitnessNonceSize
+        .print_mutated_block_raw_hash(&peer.client, &wallet_funds.address)
+        .await;
+
+    let _ = MutatedBlockError::BadWitnessMerkleMatch
+        .print_mutated_block_raw_hash(&peer.client, &wallet_funds.address)
+        .await;
+
+    let _ = MutatedBlockError::UnexpectedWitness
+        .print_mutated_block_raw_hash(&peer.client, &wallet_funds.address)
+        .await;
+
     loop {
-        network.mine();
+        network.mine(None);
         tokio::time::sleep(Duration::from_secs(cli.mine_interval)).await;
     }
 }
